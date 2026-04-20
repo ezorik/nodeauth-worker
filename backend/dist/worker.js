@@ -46219,12 +46219,14 @@ async function batchInsertVaultItems(dbClient, items, key, createdBy, startSortO
 // src/features/vault/vaultService.ts
 init_crypto();
 
-// src/shared/utils/totp.ts
+// src/shared/utils/otp/base.ts
 function validateBase32Secret(secret) {
   if (!secret || typeof secret !== "string") return false;
   const cleaned = secret.replace(/\s/g, "").toUpperCase();
   return /^[A-Z2-7]+=*$/.test(cleaned) && cleaned.length >= 8;
 }
+
+// src/shared/utils/otp/index.ts
 function parseOTPAuthURI(uri) {
   try {
     if (!uri || typeof uri !== "string" || uri.length > 2e3) return null;
@@ -46244,26 +46246,30 @@ function parseOTPAuthURI(uri) {
     }
     const url = new URL(uri);
     if (url.protocol !== "otpauth:") return null;
-    const type = url.hostname;
-    if (type !== "totp" && type !== "hotp") return null;
-    const label = decodeURIComponent(url.pathname.substring(1));
+    const type = url.hostname.toLowerCase();
+    if (type !== "totp" && type !== "hotp" && type !== "steam") return null;
     const params = new URLSearchParams(url.search);
     const secret = params.get("secret");
     if (!validateBase32Secret(secret)) return null;
+    const label = decodeURIComponent(url.pathname.substring(1));
     const [issuer, account] = label.includes(":") ? label.split(":", 2) : ["", label];
     const issuerName = sanitizeInput(params.get("issuer") || issuer, 50);
-    const isSteam = issuerName.toLowerCase() === "steam" || label.toLowerCase().includes("steam");
+    const isSteam = type === "steam" || params.get("algorithm")?.toUpperCase() === "STEAM" || params.get("tokenType")?.toUpperCase() === "STEAM";
+    let algorithm = (params.get("algorithm") || "SHA1").toUpperCase().replace("SHA1", "SHA-1").replace("SHA256", "SHA-256").replace("SHA512", "SHA-512");
+    if (!["SHA-1", "SHA-256", "SHA-512", "STEAM"].includes(algorithm)) {
+      algorithm = "SHA-1";
+    }
     const digits = parseInt(params.get("digits") || (isSteam ? "5" : "6"));
     const period = parseInt(params.get("period") || "30");
     if (digits < 5 || digits > 8 || period < 15 || period > 300) return null;
     return {
-      type,
+      type: type === "steam" ? "totp" : type,
       label: sanitizeInput(label, 100),
       issuer: issuerName,
       account: sanitizeInput(account || label, 100),
       secret: secret.replace(/[\s=]/g, "").toUpperCase(),
-      algorithm: isSteam ? "STEAM" : (params.get("algorithm") || "SHA-1").toUpperCase().replace("SHA1", "SHA-1").replace("SHA256", "SHA-256").replace("SHA512", "SHA-512"),
-      digits,
+      algorithm: isSteam ? "STEAM" : algorithm,
+      digits: isSteam ? 5 : digits,
       period
     };
   } catch {
@@ -46275,7 +46281,7 @@ function buildOTPAuthURI(data) {
   const label = encodeURIComponent(`${service}:${account}`);
   const issuer = encodeURIComponent(service);
   if (algorithm === "STEAM") {
-    return `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}`;
+    return `otpauth://steam/${label}?secret=${secret}&issuer=${issuer}&algorithm=STEAM&digits=5`;
   }
   const algoParam = algorithm.replace("-", "");
   return `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=${algoParam}&digits=${digits}&period=${period}`;
@@ -46364,15 +46370,30 @@ var VaultService = class {
     if (typeof account === "string" && account.includes(":")) {
       account = account.split(":").pop()?.trim() || account;
     }
-    account = sanitizeInput(account, 100);
-    category = sanitizeInput(category || "", 30);
-    const existing = await this.repository.findByServiceAccount(service, account);
+    const existing = await this.repository.findByServiceAccountAny(service, account);
+    let maxSort;
     if (existing) {
+      if (existing.deletedAt !== null) {
+        const normalizedSecret2 = secret.replace(/\s/g, "").toUpperCase();
+        const encryptedSecret2 = await encryptField(normalizedSecret2, this.encryptionKey);
+        maxSort = await this.repository.getMaxSortOrder();
+        await this.repository.update(existing.id, {
+          category: category || "",
+          secret: encryptedSecret2,
+          algorithm: algorithm || "SHA1",
+          digits: digits || 6,
+          period: period || 30,
+          sortOrder: maxSort + 1,
+          deletedAt: null
+          // Explicitly revive!
+        });
+        return await this.repository.findById(existing.id);
+      }
       throw new AppError("account_exists", 409);
     }
     const normalizedSecret = secret.replace(/\s/g, "").toUpperCase();
     const encryptedSecret = await encryptField(normalizedSecret, this.encryptionKey);
-    const maxSort = await this.repository.getMaxSortOrder();
+    maxSort = await this.repository.getMaxSortOrder();
     return await this.repository.create({
       id: crypto.randomUUID(),
       service,
@@ -46586,32 +46607,67 @@ var VaultService = class {
       if (e2 instanceof AppError) throw e2;
       throw new AppError("parse_failed", 400);
     }
-    const existingItems = await this.repository.findAll();
-    const existingSet = new Set(existingItems.map((row) => this.normalizeSignature(row.service, row.account)));
+    const allItems = await this.repository.findAllIncludeDeleted();
+    const existingMap = new Map(
+      allItems.map((row) => [this.normalizeSignature(row.service, row.account), row])
+    );
     const uniqueAccountsToInsert = [];
+    const accountsToRevive = [];
     const seenInBatch = /* @__PURE__ */ new Set();
     let validCount = 0;
+    let duplicateCount = 0;
     for (const acc of rawAccounts) {
       if (acc.service && acc.account && validateBase32Secret(acc.secret)) {
         if (typeof acc.account === "string" && acc.account.includes(":")) {
           acc.account = acc.account.split(":").pop()?.trim() || acc.account;
         }
         const signature = this.normalizeSignature(acc.service, acc.account);
-        if (!seenInBatch.has(signature)) {
-          validCount++;
-          seenInBatch.add(signature);
-          if (!existingSet.has(signature)) {
-            uniqueAccountsToInsert.push(acc);
-          }
+        if (seenInBatch.has(signature)) continue;
+        seenInBatch.add(signature);
+        validCount++;
+        const existingItem = existingMap.get(signature);
+        if (!existingItem) {
+          uniqueAccountsToInsert.push(acc);
+        } else if (existingItem.deletedAt !== null) {
+          accountsToRevive.push({ ...acc, id: existingItem.id });
+        } else {
+          duplicateCount++;
         }
       }
     }
-    const maxSortOrder = await this.repository.getMaxSortOrder();
-    const insertedCount = await batchInsertVaultItems(this.env.DB, uniqueAccountsToInsert, this.encryptionKey, userId, maxSortOrder);
+    let totalProcessedCount = 0;
+    if (uniqueAccountsToInsert.length > 0) {
+      const startSort = await this.repository.getMaxSortOrder();
+      const count = await batchInsertVaultItems(this.env.DB, uniqueAccountsToInsert, this.encryptionKey, userId, startSort);
+      totalProcessedCount += count;
+    }
+    if (accountsToRevive.length > 0) {
+      const startSortForRevive = await this.repository.getMaxSortOrder();
+      const preparedRevives = await Promise.all(accountsToRevive.map(async (acc, idx) => {
+        const normalizedSecret = acc.secret.replace(/\s/g, "").toUpperCase();
+        const secretEncrypted = await encryptField(normalizedSecret, this.encryptionKey);
+        return {
+          id: acc.id,
+          data: {
+            category: acc.category || "",
+            secret: secretEncrypted,
+            algorithm: acc.algorithm || "SHA1",
+            digits: acc.digits || 6,
+            period: acc.period || 30,
+            sortOrder: startSortForRevive + (accountsToRevive.length - idx),
+            deletedAt: null,
+            // 👈 显式复活标记
+            updatedBy: userId
+          }
+        };
+      }));
+      await this.repository.batchUpdate(preparedRevives);
+      totalProcessedCount += accountsToRevive.length;
+    }
     return {
-      count: insertedCount,
-      total: validCount,
-      duplicates: validCount - insertedCount
+      count: totalProcessedCount,
+      duplicates: duplicateCount,
+      pending: false
     };
   }
   /**
@@ -46630,7 +46686,7 @@ var VaultService = class {
               results.push({ success: true, type, id: action.id, serverId: res.id });
             } catch (e2) {
               if (e2 instanceof AppError && e2.statusCode === 409) {
-                const existing = await this.repository.findByServiceAccount(data.service, data.account);
+                const existing = await this.repository.findByServiceAccountAny(data.service, data.account);
                 if (existing) {
                   results.push({ success: true, type, id: action.id, serverId: existing.id });
                 } else {
@@ -46797,10 +46853,17 @@ var VaultRepository = class {
     this.db = dbClient;
   }
   /**
-   * 获取所有的 vault items (2FA accounts)
+   * 获取所有的 vault items (仅查未删除)
    */
   async findAll() {
     return await this.db.select().from(vault4).where(isNull(vault4.deletedAt)).orderBy(desc(vault4.sortOrder), desc(vault4.createdAt));
+  }
+  /**
+   * 获取所有的 vault items (包含软删除/回收站数据)
+   * 专用于去重检查场景，防止将回收站账号重新导入
+   */
+  async findAllIncludeDeleted() {
+    return await this.db.select().from(vault4).orderBy(desc(vault4.sortOrder), desc(vault4.createdAt));
   }
   /**
    * 获取当前最大排序值
@@ -46912,6 +46975,7 @@ var VaultRepository = class {
   }
   /**
    * 根据 service/account 查找记录 (大小写不敏感，自动 trim)
+   * 只匹配未被软删除的记录
    */
   async findByServiceAccount(service, account) {
     const normalizedService = service.trim().toLowerCase();
@@ -46921,6 +46985,22 @@ var VaultRepository = class {
         sql`lower(${vault4.service}) = ${normalizedService}`,
         sql`lower(${vault4.account}) = ${normalizedAccount}`,
         isNull(vault4.deletedAt)
+      )
+    ).limit(1);
+    return result[0];
+  }
+  /**
+   * 根据 service/account 查找记录 (包含过回收站的软删除记录)
+   * 专用于去重检查，防止添加回收站中尚存在的账号
+   */
+  async findByServiceAccountAny(service, account) {
+    const normalizedService = service.trim().toLowerCase();
+    const normalizedAccount = account.trim().toLowerCase();
+    const result = await this.db.select().from(vault4).where(
+      and(
+        sql`lower(${vault4.service}) = ${normalizedService}`,
+        sql`lower(${vault4.account}) = ${normalizedAccount}`
+        // 注意：此处故意不加 isNull(vault.deletedAt)，覆盖回收站内已删除的记录
       )
     ).limit(1);
     return result[0];
@@ -46955,6 +47035,26 @@ var VaultRepository = class {
     }
     await this.db.update(vault4).set({ ...data, updatedAt: Date.now() }).where(eq(vault4.id, id));
     return await this.findById(id);
+  }
+  /**
+   * 批量更新 (用于导入复活场景等)
+   */
+  async batchUpdate(updates) {
+    if (!updates || updates.length === 0) return;
+    if (this.db.batch) {
+      const BATCH_SIZE = 50;
+      for (let i2 = 0; i2 < updates.length; i2 += BATCH_SIZE) {
+        const chunk = updates.slice(i2, i2 + BATCH_SIZE);
+        const stmts = chunk.map(
+          (u2) => this.db.update(vault4).set({ ...u2.data, updatedAt: Date.now() }).where(eq(vault4.id, u2.id))
+        );
+        await this.db.batch(stmts);
+      }
+    } else {
+      for (const u2 of updates) {
+        await this.update(u2.id, u2.data);
+      }
+    }
   }
   /**
    * 删除单个 item (支持乐观锁校验)
@@ -47035,14 +47135,12 @@ vault5.get("/", async (c2) => {
   const search = c2.req.query("search") || "";
   const category = c2.req.query("category") || "";
   const service = getService2(c2);
-  const repo = new VaultRepository(c2.env.DB);
   const result = await service.getAccountsPaginated(page, limit, search, category);
-  const trashCount = await repo.countDeleted();
   return c2.json({
     success: true,
     vault: result.items,
     categoryStats: result.categoryStats,
-    trashCount,
+    trashCount: result.trashCount,
     pagination: {
       page,
       limit,
@@ -50690,13 +50788,13 @@ var AwsV4Signer = class {
     const cacheKey2 = [this.secretAccessKey, date3, this.region, this.service].join();
     let kCredentials = this.cache.get(cacheKey2);
     if (!kCredentials) {
-      const kDate = await hmac2("AWS4" + this.secretAccessKey, date3);
-      const kRegion = await hmac2(kDate, this.region);
-      const kService = await hmac2(kRegion, this.service);
-      kCredentials = await hmac2(kService, "aws4_request");
+      const kDate = await hmac3("AWS4" + this.secretAccessKey, date3);
+      const kRegion = await hmac3(kDate, this.region);
+      const kService = await hmac3(kRegion, this.service);
+      kCredentials = await hmac3(kService, "aws4_request");
       this.cache.set(cacheKey2, kCredentials);
     }
-    return buf2hex(await hmac2(kCredentials, await this.stringToSign()));
+    return buf2hex(await hmac3(kCredentials, await this.stringToSign()));
   }
   async stringToSign() {
     return [
@@ -50727,7 +50825,7 @@ var AwsV4Signer = class {
     return hashHeader;
   }
 };
-async function hmac2(key, string) {
+async function hmac3(key, string) {
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
     typeof key === "string" ? encoder5.encode(key) : key,
